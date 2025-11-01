@@ -1,0 +1,28 @@
+{
+  "name": "sourcemap-harvest",
+  "version": "1.0.0",
+  "description": "Extract original source files from website sourcemaps using Chrome DevTools Protocol",
+  "main": "index.js",
+  "bin": {
+    "sourcemap-harvest": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "sourcemap",
+    "source-map",
+    "cdp",
+    "chrome-devtools-protocol",
+    "puppeteer",
+    "reverse-engineering"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "puppeteer": "^24.27.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
