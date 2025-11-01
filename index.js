@@ -8,8 +8,9 @@
  * 3. Parse sourcemaps to extract original source file paths
  * 4. Download/save original source files to local filesystem
  *
- * Usage: node index.js <url>
+ * Usage: node index.js <url> [url2] [url3] ...
  * Example: node index.js https://example.com
+ * Example: node index.js https://example.com https://example.com/about https://example.com/contact
  */
 
 const fs = require('fs');
@@ -23,12 +24,18 @@ const puppeteer = require('puppeteer');
 // Configuration
 // ============================================================================
 
-const TARGET_URL = process.argv[2] || 'https://example.com';
+const TARGET_URLS = process.argv.slice(2).length > 0 
+  ? process.argv.slice(2) 
+  : ['https://example.com'];
 const OUTPUT_DIR = 'out';
 
 // Only keep files whose paths contain these substrings (empty array = keep all)
 // Modify this to filter which files to extract
 const PATH_FILTERS = ['/src/'];
+
+// Wait time in milliseconds after network is idle to capture dynamically loaded scripts
+// Increase this if the site loads content via code splitting or lazy loading
+const WAIT_AFTER_LOAD_MS = 3000;
 
 // ============================================================================
 // Utility Functions
@@ -272,22 +279,32 @@ const extractGeneratedScripts = async (scripts, client) => {
  */
 const extractOriginalSources = async (scripts) => {
   let savedCount = 0;
+  let skippedNoMapRef = 0;
+  let skippedFetchFailed = 0;
+  let skippedInvalid = 0;
 
   for (const [, metadata] of scripts) {
     const scriptUrl = metadata.url || '';
     const sourceMapReference = metadata.sourceMapURL || '';
 
-    if (!sourceMapReference) continue;
+    if (!sourceMapReference) {
+      skippedNoMapRef++;
+      continue;
+    }
 
     // Resolve sourcemap URL
     const sourceMapUrl = resolveSourceMapUrl(sourceMapReference, scriptUrl);
-    if (!sourceMapUrl) continue;
+    if (!sourceMapUrl) {
+      skippedFetchFailed++;
+      continue;
+    }
 
     // Fetch sourcemap
     let sourceMapBuffer;
     try {
       sourceMapBuffer = await fetchUrl(sourceMapUrl);
     } catch (e) {
+      skippedFetchFailed++;
       continue; // Skip if sourcemap can't be fetched
     }
 
@@ -296,6 +313,7 @@ const extractOriginalSources = async (scripts) => {
     try {
       sourceMap = JSON.parse(sourceMapBuffer.toString('utf8'));
     } catch (e) {
+      skippedInvalid++;
       continue; // Skip if sourcemap is invalid
     }
 
@@ -346,6 +364,14 @@ const extractOriginalSources = async (scripts) => {
     }
   }
 
+  if (skippedNoMapRef > 0 || skippedFetchFailed > 0 || skippedInvalid > 0) {
+    console.log(
+      `  Note: ${skippedNoMapRef} script(s) had no sourcemap, ` +
+        `${skippedFetchFailed} sourcemap(s) couldn't be fetched, ` +
+        `${skippedInvalid} sourcemap(s) were invalid`
+    );
+  }
+
   return savedCount;
 };
 
@@ -353,8 +379,88 @@ const extractOriginalSources = async (scripts) => {
 // Main Entry Point
 // ============================================================================
 
+/**
+ * Process a single URL and collect all scripts
+ * For SvelteKit/SPAs: attempts to discover and navigate to routes programmatically
+ */
+const processUrl = async (url, cdpClient, page, scripts) => {
+  console.log(`\n📍 Processing: ${url}`);
+
+  // Navigate to target page and wait for all resources
+  console.log('  Loading page and collecting scripts...');
+  await page.goto(url, { waitUntil: 'networkidle0' });
+
+  // Wait additional time for dynamically loaded scripts (code splitting, lazy loading)
+  if (WAIT_AFTER_LOAD_MS > 0) {
+    console.log(`  Waiting ${WAIT_AFTER_LOAD_MS}ms for dynamically loaded content...`);
+    await new Promise((resolve) => setTimeout(resolve, WAIT_AFTER_LOAD_MS));
+  }
+
+  // For SvelteKit/SPAs: try to discover and click navigation links to load route chunks
+  console.log('  Discovering and navigating to routes...');
+  try {
+    const discoveredRoutes = await page.evaluate(() => {
+      const routes = new Set();
+      // Find all anchor tags that look like internal navigation
+      document.querySelectorAll('a[href]').forEach((link) => {
+        const href = link.getAttribute('href');
+        if (href && !href.startsWith('http') && !href.startsWith('#') && href.startsWith('/')) {
+          routes.add(href);
+        }
+      });
+      return Array.from(routes).slice(0, 10); // Limit to first 10 routes to avoid too many
+    });
+
+    // Navigate to discovered routes (SvelteKit will load route-specific chunks)
+    for (const route of discoveredRoutes.slice(0, 5)) {
+      try {
+        const fullUrl = new URL(route, url).toString();
+        const scriptCountBefore = scripts.size;
+        
+        await page.goto(fullUrl, { waitUntil: 'networkidle0', timeout: 5000 });
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        
+        if (scripts.size > scriptCountBefore) {
+          console.log(`    → Found new scripts at ${route}`);
+        }
+      } catch (e) {
+        // Route might not exist or timeout, continue
+      }
+    }
+    
+    // Return to original page
+    await page.goto(url, { waitUntil: 'networkidle0' });
+  } catch (e) {
+    // Route discovery failed, continue with normal flow
+  }
+
+  // Try to trigger lazy-loaded routes in SPAs by scrolling
+  console.log('  Scrolling page to trigger lazy-loaded content...');
+  await page.evaluate(async () => {
+    await new Promise((resolve) => {
+      let totalHeight = 0;
+      const distance = 100;
+      const timer = setInterval(() => {
+        const scrollHeight = document.body.scrollHeight;
+        window.scrollBy(0, distance);
+        totalHeight += distance;
+
+        if (totalHeight >= scrollHeight) {
+          clearInterval(timer);
+          resolve();
+        }
+      }, 100);
+    });
+  });
+
+  // Wait a bit more after scrolling for any triggered scripts
+  if (WAIT_AFTER_LOAD_MS > 0) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+};
+
 (async () => {
-  console.log(`Connecting to ${TARGET_URL}...`);
+  console.log(`🚀 sourcemap-harvest - Processing ${TARGET_URLS.length} URL(s)`);
 
   // Launch browser and enable CDP
   const browser = await puppeteer.launch({
@@ -370,7 +476,7 @@ const extractOriginalSources = async (scripts) => {
   await cdpClient.send('Runtime.enable');
   await cdpClient.send('Debugger.enable');
 
-  // Collect all scripts as they're parsed
+  // Collect all scripts as they're parsed (across all URLs)
   const scripts = new Map(); // scriptId -> { url, sourceMapURL }
 
   cdpClient.on('Debugger.scriptParsed', (event) => {
@@ -380,15 +486,22 @@ const extractOriginalSources = async (scripts) => {
     });
   });
 
-  // Navigate to target page and wait for all resources
-  console.log('Loading page and collecting scripts...');
-  await page.goto(TARGET_URL, { waitUntil: 'networkidle0' });
+  // Process each URL
+  for (const url of TARGET_URLS) {
+    try {
+      await processUrl(url, cdpClient, page, scripts);
+    } catch (error) {
+      console.error(`  ⚠️  Error processing ${url}:`, error.message);
+    }
+  }
+
+  console.log(`\n📦 Collected ${scripts.size} unique script(s) across all pages`);
 
   // Prepare output directory
   ensureDir(OUTPUT_DIR);
 
   // Extract and save files
-  console.log('Extracting source files...');
+  console.log('📥 Extracting source files...');
   const savedGenerated = await extractGeneratedScripts(scripts, cdpClient);
   const savedOriginal = await extractOriginalSources(scripts);
 

@@ -27,7 +27,7 @@ npm install
 ## Usage
 
 ```bash
-node index.js <url>
+node index.js <url> [url2] [url3] ...
 ```
 
 Or use the npm script:
@@ -35,10 +35,18 @@ Or use the npm script:
 npm start <url>
 ```
 
-Example:
+Examples:
 ```bash
+# Single page (usually enough for SPAs)
 node index.js https://example.com
+
+# Multiple pages (useful for MPAs or to capture route-specific code in SPAs)
+node index.js https://example.com https://example.com/about https://example.com/contact
 ```
+
+**Tip**: 
+- **For SvelteKit/SPAs**: The tool automatically discovers routes from navigation links and visits them to load route-specific chunks. Visiting just the main page usually works well, but you can list additional routes to ensure complete coverage.
+- **For Multi-Page Applications**: You'll need to list multiple URLs to capture all pages.
 
 The extracted source files will be saved to the `out/` directory.
 
